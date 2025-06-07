@@ -21,16 +21,22 @@ declare LOG_DIR
 declare LOG_FILE
 declare VERBOSE_MODE
 declare INTERACTIVE_MODE
+declare LOCK_FILE
+declare LOCK_FD
 
 SCRIPT_NAME="$(basename "${0}")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT_PID="$$"
+SCRIPT_PID="$"
 TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
 
 # Logging configuration
 LOG_DIR="/var/log/mariadb-backup"
 LOG_FILE="${LOG_DIR}/mariadb-backup_${TIMESTAMP}.log"
 VERBOSE_MODE=false
+
+# Lock configuration
+LOCK_FILE="/var/run/mariadb-backup.lock"
+LOCK_FD=200
 
 # Detect execution context (interactive vs cron/daemon)
 INTERACTIVE_MODE=false
@@ -71,6 +77,97 @@ setup_logging() {
     fi
     
     return 0
+}
+
+#===============================================================================
+# LOCK MANAGEMENT FUNCTIONS
+#===============================================================================
+
+#-------------------------------------------------------------------------------
+# Function: acquire_lock
+# Description: Acquire exclusive lock to prevent concurrent executions
+# Arguments: None
+# Returns: 0 on success, 1 on failure
+#-------------------------------------------------------------------------------
+acquire_lock() {
+    local lock_dir
+    
+    # Create lock directory if it doesn't exist
+    lock_dir="$(dirname "${LOCK_FILE}")"
+    if [[ ! -d "${lock_dir}" ]]; then
+        if ! mkdir -p "${lock_dir}" 2>/dev/null; then
+            log_error "Cannot create lock directory: ${lock_dir}"
+            return 1
+        fi
+    fi
+    
+    # Try to acquire exclusive lock (non-blocking)
+    if ! exec {LOCK_FD}>"${LOCK_FILE}"; then
+        log_error "Cannot open lock file: ${LOCK_FILE}"
+        return 1
+    fi
+    
+    if ! flock -n "${LOCK_FD}"; then
+        log_error "Another instance of ${SCRIPT_NAME} is already running"
+        log_verbose "Lock file: ${LOCK_FILE}"
+        if [[ -r "${LOCK_FILE}" ]]; then
+            local running_pid
+            running_pid="$(head -1 "${LOCK_FILE}" 2>/dev/null || true)"
+            if [[ -n "${running_pid}" ]] && [[ "${running_pid}" =~ ^[0-9]+$ ]]; then
+                log_verbose "Running instance PID: ${running_pid}"
+                # Check if the process is actually running
+                if kill -0 "${running_pid}" 2>/dev/null; then
+                    log_verbose "Process ${running_pid} is still active"
+                else
+                    log_warn "Stale lock file detected (process ${running_pid} not running)"
+                fi
+            fi
+        fi
+        exec {LOCK_FD}>&-  # Close file descriptor
+        return 1
+    fi
+    
+    # Write current PID to lock file
+    printf "%s\n" "${SCRIPT_PID}" >&"${LOCK_FD}"
+    
+    log_verbose "Lock acquired successfully"
+    return 0
+}
+
+#-------------------------------------------------------------------------------
+# Function: release_lock
+# Description: Release the exclusive lock
+# Arguments: None
+# Returns: None
+#-------------------------------------------------------------------------------
+release_lock() {
+    if [[ -n "${LOCK_FD}" ]] && [[ "${LOCK_FD}" =~ ^[0-9]+$ ]]; then
+        # Release the lock
+        flock -u "${LOCK_FD}" 2>/dev/null || true
+        exec {LOCK_FD}>&- 2>/dev/null || true
+        log_verbose "Lock released successfully"
+    fi
+    
+    # Clean up lock file if it exists and contains our PID
+    if [[ -f "${LOCK_FILE}" ]]; then
+        local file_pid
+        file_pid="$(head -1 "${LOCK_FILE}" 2>/dev/null || true)"
+        if [[ "${file_pid}" == "${SCRIPT_PID}" ]]; then
+            rm -f "${LOCK_FILE}" 2>/dev/null || true
+            log_verbose "Lock file cleaned up"
+        fi
+    fi
+}
+
+#-------------------------------------------------------------------------------
+# Function: setup_exit_trap
+# Description: Setup trap to ensure lock is released on script exit
+# Arguments: None
+# Returns: None
+#-------------------------------------------------------------------------------
+setup_exit_trap() {
+    trap 'release_lock; log_info "Script terminated"' EXIT INT TERM
+    log_verbose "Exit trap configured for lock cleanup"
 }
 
 
@@ -190,6 +287,7 @@ OPTIONS:
     -h, --help          Show this help message
     -v, --verbose       Enable verbose mode (more detailed output)
     -l, --log-dir DIR   Set log directory (default: ${LOG_DIR})
+    --lock-file FILE    Set lock file path (default: ${LOCK_FILE})
 
 EXECUTION MODES:
     Interactive:        ./script.sh (colors, terminal output)
@@ -198,6 +296,7 @@ EXECUTION MODES:
 EXAMPLES:
     ${SCRIPT_NAME} --verbose
     ${SCRIPT_NAME} --log-dir /custom/log/path
+    ${SCRIPT_NAME} --lock-file /tmp/custom-backup.lock
 
 EOF
 }
@@ -234,8 +333,17 @@ parse_arguments() {
                     return 1
                 fi
                 ;;
-            *)
-                log_error "Unknown option: ${1}"
+            --lock-file)
+                if [[ -n "${2:-}" ]]; then
+                    LOCK_FILE="${2}"
+                    log_verbose "Custom lock file set: ${LOCK_FILE}"
+                    shift
+                else
+                    log_error "Option --lock-file requires a file path"
+                    return 1
+                fi
+                ;;
+            *)                log_error "Unknown option: ${1}"
                 show_usage
                 return 1
                 ;;
@@ -259,6 +367,15 @@ initialize_script() {
         return 1
     fi
     
+    # Setup exit trap for cleanup
+    setup_exit_trap
+    
+    # Acquire lock to prevent concurrent executions
+    if ! acquire_lock; then
+        log_error "Failed to acquire lock - exiting"
+        return 1
+    fi
+    
     # Show banner
     show_banner
     
@@ -266,6 +383,7 @@ initialize_script() {
     if [[ "${VERBOSE_MODE}" == true ]]; then
         log_verbose "Script directory: ${SCRIPT_DIR}"
         log_verbose "Log file: ${LOG_FILE}"
+        log_verbose "Lock file: ${LOCK_FILE}"
         log_verbose "Interactive mode: ${INTERACTIVE_MODE}"
         log_verbose "Terminal detection: stdin=$(if [[ -t 0 ]]; then printf "TTY"; else printf "pipe"; fi), stdout=$(if [[ -t 1 ]]; then printf "TTY"; else printf "pipe"; fi), stderr=$(if [[ -t 2 ]]; then printf "TTY"; else printf "pipe"; fi)"
         log_verbose "Parent process: $(ps -o comm= -p $PPID 2>/dev/null || printf "unknown")"
