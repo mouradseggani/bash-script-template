@@ -101,73 +101,104 @@ acquire_lock() {
         fi
     fi
     
-    # Try to acquire exclusive lock (non-blocking)
+    # Open lock file
     if ! exec {LOCK_FD}>"${LOCK_FILE}"; then
         log_error "Cannot open lock file: ${LOCK_FILE}"
         return 1
     fi
     
+    # Try to acquire exclusive lock (non-blocking)
     if ! flock -n "${LOCK_FD}"; then
-        log_error "Another instance of ${SCRIPT_NAME} is already running"
-        log_verbose "Lock file: ${LOCK_FILE}"
-        if [[ -r "${LOCK_FILE}" ]]; then
-            local running_pid
-            running_pid="$(head -1 "${LOCK_FILE}" 2>/dev/null || true)"
-            if [[ -n "${running_pid}" ]] && [[ "${running_pid}" =~ ^[0-9]+$ ]]; then
-                log_verbose "Running instance PID: ${running_pid}"
-                # Check if the process is actually running
-                if kill -0 "${running_pid}" 2>/dev/null; then
-                    log_verbose "Process ${running_pid} is still active"
-                else
-                    log_warn "Stale lock file detected (process ${running_pid} not running)"
-                fi
-            fi
-        fi
-        exec {LOCK_FD}>&-  # Close file descriptor
+        log_error "Another instance is already running"
+        check_running_instance
+        exec {LOCK_FD}>&-
         return 1
     fi
     
     # Write current PID to lock file
     printf "%s\n" "${SCRIPT_PID}" >&"${LOCK_FD}"
     
-    log_verbose "Lock acquired successfully"
+    log_verbose "Exclusive lock acquired"
     return 0
 }
 
 #-------------------------------------------------------------------------------
+# Function: check_running_instance
+# Description: Check and report details about running instance
+# Arguments: None
+# Returns: None
+#-------------------------------------------------------------------------------
+check_running_instance() {
+    local running_pid
+    
+    log_verbose "Lock file: ${LOCK_FILE}"
+    
+    if [[ ! -r "${LOCK_FILE}" ]]; then
+        return 0
+    fi
+    
+    running_pid="$(head -1 "${LOCK_FILE}" 2>/dev/null | tr -d '[:space:]')"
+    
+    if [[ -z "${running_pid}" ]] || [[ ! "${running_pid}" =~ ^[0-9]+$ ]]; then
+        log_verbose "Invalid PID in lock file"
+        return 0
+    fi
+    
+    log_verbose "Lock file PID: ${running_pid}"
+    
+    if kill -0 "${running_pid}" 2>/dev/null; then
+        log_verbose "Process ${running_pid} is active"
+    else
+        log_warn "Stale lock detected - process ${running_pid} not running"
+    fi
+}
+
+#-------------------------------------------------------------------------------
 # Function: release_lock
-# Description: Release the exclusive lock
+# Description: Release the exclusive lock and cleanup
 # Arguments: None
 # Returns: None
 #-------------------------------------------------------------------------------
 release_lock() {
     if [[ -n "${LOCK_FD}" ]] && [[ "${LOCK_FD}" =~ ^[0-9]+$ ]]; then
-        # Release the lock
         flock -u "${LOCK_FD}" 2>/dev/null || true
         exec {LOCK_FD}>&- 2>/dev/null || true
-        log_verbose "Lock released successfully"
+        log_verbose "Lock released"
     fi
     
-    # Clean up lock file if it exists and contains our PID
-    if [[ -f "${LOCK_FILE}" ]]; then
-        local file_pid
-        file_pid="$(head -1 "${LOCK_FILE}" 2>/dev/null || true)"
-        if [[ "${file_pid}" == "${SCRIPT_PID}" ]]; then
-            rm -f "${LOCK_FILE}" 2>/dev/null || true
-            log_verbose "Lock file cleaned up"
-        fi
+    cleanup_lock_file
+}
+
+#-------------------------------------------------------------------------------
+# Function: cleanup_lock_file
+# Description: Remove lock file if it belongs to current process
+# Arguments: None
+# Returns: None
+#-------------------------------------------------------------------------------
+cleanup_lock_file() {
+    local file_pid
+    
+    if [[ ! -f "${LOCK_FILE}" ]]; then
+        return 0
+    fi
+    
+    file_pid="$(head -1 "${LOCK_FILE}" 2>/dev/null | tr -d '[:space:]')"
+    
+    if [[ "${file_pid}" == "${SCRIPT_PID}" ]]; then
+        rm -f "${LOCK_FILE}" 2>/dev/null || true
+        log_verbose "Lock file cleaned up"
     fi
 }
 
 #-------------------------------------------------------------------------------
 # Function: setup_exit_trap
-# Description: Setup trap to ensure lock is released on script exit
+# Description: Setup signal handlers for clean exit
 # Arguments: None
 # Returns: None
 #-------------------------------------------------------------------------------
 setup_exit_trap() {
     trap 'release_lock; log_info "Script terminated"' EXIT INT TERM
-    log_verbose "Exit trap configured for lock cleanup"
+    log_verbose "Exit handlers configured"
 }
 
 
@@ -370,9 +401,8 @@ initialize_script() {
     # Setup exit trap for cleanup
     setup_exit_trap
     
-    # Acquire lock to prevent concurrent executions
+    # Acquire exclusive lock
     if ! acquire_lock; then
-        log_error "Failed to acquire lock - exiting"
         return 1
     fi
     
